@@ -578,8 +578,88 @@ pub(crate) fn content_requests(app: &mut App, fr: &mut Frame) {
         bridge.metadata_view(), bridge.marker_preferences());
 }
 
+/// **May the page `entry`'s command run now?** Only the page that holds input acts: a page a
+/// surface still covers, or a page beneath another, is refused (a command it queued before it was
+/// covered must not navigate for it). A surface whose own `Dismiss` is already parked counts as
+/// closed. The FIFO runner executes a head in the drain, ahead of NAV COMMIT, so a picker that
+/// closes on its pick and reports to its page (*Play Version*, *Also available*) has only PARKED its
+/// dismissal when the page's command for that pick arrives. Before the runner (#1392) these gates ran
+/// after the frame's commit and never saw the closing surface; asked of the container alone they
+/// refused the pick (#1424). One answer for the five page-command families below.
+fn holds_input(pages: &plx_ui::dispatch::Dispatcher<bridge::AppHost>, entry: EntryId) -> bool {
+    pages.input_owner_after_dismissals() == Some(InputOwner::Entry(entry))
+}
+
 fn halt_screen_preview(app: &mut ScreenCommandApp<'_, '_>) {
     halt_preview_now(&mut app.player.session, &mut app.adapters.player);
+}
+
+/// The item a hero preview is asked for, and the part it would open ([`ContentReq::PreviewStart`]).
+#[cfg(feature = "play-feed")]
+pub(crate) struct HeroPreviewAsk<'a> {
+    pub(crate) sid: plx_plex::plex::ServerId,
+    pub(crate) rk: &'a str,
+    pub(crate) part: &'a str,
+    pub(crate) vcodec: &'a str,
+    pub(crate) acodec: &'a str,
+    pub(crate) title: &'a str,
+}
+
+/// How [`start_hero_preview`] ended.
+#[cfg(feature = "play-feed")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeroPreview {
+    /// The item has no extra to preview; the preview machine remembers it.
+    NoExtra,
+    /// Nothing was started. A boot that composed no Feed is remembered (`Fact::RefusedDirect`), and
+    /// so is a standing refusal of the machine's own (`preview::blocked` answers from it), so the
+    /// page's dwell gate does not ask again; a busy machine and a refused admission remember
+    /// nothing, and the page asks again after its next dwell.
+    Refused,
+    /// The resolve is in flight and the asking page owns the preview.
+    Started,
+}
+
+/// **`ContentReq::PreviewStart`, performed.** A hero preview is a Feed engine's: the resolve lands a
+/// direct-play plan the Feed opens muted. A boot that composed no Feed (`BackendSet::feed` false)
+/// has nothing to open it on, so the request is refused HERE, once, through the preview machine's
+/// own fact for an item it cannot preview (`Fact::RefusedDirect`, the same one the build with no
+/// Feed compiled in says): the page's dwell gate (`preview::blocked`) then stops asking, and no
+/// resolve runs. Left to the planner, the refusal would land as a standing verdict
+/// (`NoQualifiedBackend`), which `player::state()` reads as an Error and `report::tick_preview`
+/// reports as a failed preview.
+///
+/// A boot with only the URI driver is refused the same way, and the planner already refused it
+/// (`pms_uri_possible` excludes a preview, and no display places a preview rectangle:
+/// `DisplayEvidence::preview_rectangle` is false on every path). A display that did place one
+/// would be the reason to revisit this gate.
+#[cfg(feature = "play-feed")]
+pub(crate) fn start_hero_preview(
+    session: &mut plx_media::route::PlaybackSession,
+    meta: &mut plx_data::stores::metadata::MetadataStore,
+    ask: &HeroPreviewAsk<'_>,
+    now: u32,
+) -> HeroPreview {
+    use plx_media::player::preview;
+    if !session.backends().feed {
+        preview::note_refused_direct(ask.sid, ask.rk);
+        return HeroPreview::Refused;
+    }
+    if ask.part.is_empty() {
+        preview::note_no_extra(ask.sid, ask.rk);
+        return HeroPreview::NoExtra;
+    }
+    if !matches!(preview::request_start(ask.sid, ask.rk, now), preview::Start::Accepted) {
+        return HeroPreview::Refused;
+    }
+    if plx_media::route::request_preview(session, meta, super::playback::start_caps(),
+        ask.sid, ask.rk, ask.part, ask.vcodec, ask.acodec, ask.title)
+    {
+        HeroPreview::Started
+    } else {
+        preview::note_admission_refused();
+        HeroPreview::Refused
+    }
 }
 
 fn content_command(app: &mut ScreenCommandApp<'_, '_>, source: MachineId, request: ContentReq,
@@ -590,7 +670,7 @@ fn content_command(app: &mut ScreenCommandApp<'_, '_>, source: MachineId, reques
     let _ = now;
     let MachineId::Instance(instance) = source else { return AppCommandOutcome::Refused };
     let Some(entry) = app.pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
-    if app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) { return AppCommandOutcome::Refused; }
+    if !holds_input(app.pages, entry) { return AppCommandOutcome::Refused; }
     match request {
             ContentReq::Push(arg) => {
                 halt_screen_preview(app);
@@ -633,37 +713,22 @@ fn content_command(app: &mut ScreenCommandApp<'_, '_>, source: MachineId, reques
             ContentReq::PreviewStart { sid, rk, part, vcodec, acodec, title } => {
                 #[cfg(not(feature = "play-feed"))]
                 {
-                    let _ = (sid, rk, part, vcodec, acodec, title);
-                    // Hero previews have no URI qualification.
+                    let _ = (part, vcodec, acodec, title);
+                    // Hero previews have no URI qualification. The refusal is the item's, said
+                    // once through the preview machine's own fact (`Fact::RefusedDirect`), so the
+                    // page's dwell gate (`preview::blocked`) stops asking: left unsaid, the hero
+                    // would send this request again every `DWELL_S` for as long as it holds focus.
+                    plx_media::player::preview::note_refused_direct(sid, &rk);
                     return AppCommandOutcome::Refused;
                 }
                 #[cfg(feature = "play-feed")]
+                match start_hero_preview(&mut app.player.session, app.bridge.metadata_mut(),
+                    &HeroPreviewAsk { sid, rk: &rk, part: &part, vcodec: &vcodec, acodec: &acodec, title: &title },
+                    now)
                 {
-                if part.is_empty() {
-                    plx_media::player::preview::note_no_extra(sid, &rk);
-                    return AppCommandOutcome::Completed;
-                }
-                if !matches!(
-                    plx_media::player::preview::request_start(sid, &rk, now),
-                    plx_media::player::preview::Start::Accepted
-                ) { return AppCommandOutcome::Refused; }
-                let ok = plx_media::route::request_preview(
-                    &mut app.player.session,
-                    app.bridge.metadata_mut(),
-                    super::playback::start_caps(),
-                    sid,
-                    &rk,
-                    &part,
-                    &vcodec,
-                    &acodec,
-                    &title,
-                );
-                if ok {
-                    PREVIEW_HOST.with(|h| h.set(Some(instance)));
-                } else {
-                    plx_media::player::preview::note_admission_refused();
-                    return AppCommandOutcome::Refused;
-                }
+                    HeroPreview::NoExtra => return AppCommandOutcome::Completed,
+                    HeroPreview::Refused => return AppCommandOutcome::Refused,
+                    HeroPreview::Started => PREVIEW_HOST.with(|h| h.set(Some(instance))),
                 }
             }
             ContentReq::PreviewStop => halt_screen_preview(app),
@@ -742,7 +807,7 @@ fn home_command(app: &mut ScreenCommandApp<'_, '_>, source: MachineId, request: 
     use plx_machine::machine::AppCommandOutcome;
     let MachineId::Instance(instance) = source else { return AppCommandOutcome::Refused };
     let Some(entry) = app.pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
-    if app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) || app.route() != AppArg::Home {
+    if !holds_input(app.pages, entry) || app.route() != AppArg::Home {
         return AppCommandOutcome::Refused;
     }
     match request {
@@ -813,8 +878,7 @@ pub(crate) fn execute_search_command(
     use plx_screens::registry::SearchReq;
     let MachineId::Instance(instance) = source else { return AppCommandOutcome::Refused };
     let Some(entry) = pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
-    if pages.top_arg() != Some(&AppArg::Search)
-        || pages.nav.input_owner() != Some(InputOwner::Entry(entry)) { return AppCommandOutcome::Refused; }
+    if pages.top_arg() != Some(&AppArg::Search) || !holds_input(pages, entry) { return AppCommandOutcome::Refused; }
     match &request {
         SearchReq::Back => bridge::nav_tab(pages, rig, HomeTab::Home, None, Some(ret)),
         SearchReq::Tab(tab) => {
@@ -863,8 +927,7 @@ pub(crate) fn execute_watchlist_command(
     let Some(entry) = pages.nav.entry_of_instance(instance) else { return AppCommandOutcome::RetiredSender };
     // Options come from a surface over the page, so its live sender need not be the page.
     if !matches!(request, WatchlistOut::SetOptions(_))
-        && (pages.top_arg() != Some(&AppArg::Watchlist)
-            || pages.nav.input_owner() != Some(InputOwner::Entry(entry))) {
+        && (pages.top_arg() != Some(&AppArg::Watchlist) || !holds_input(pages, entry)) {
         return AppCommandOutcome::Refused;
     }
     watchlist_request(pages, rig, entry, request, ret);
@@ -987,7 +1050,7 @@ fn library_command(app: &mut ScreenCommandApp<'_, '_>, source: MachineId,
         library_publish_shelves(app.pages, app.bridge, entry, target, hidden_page, at_head);
         return AppCommandOutcome::Completed;
     }
-    if app.pages.nav.input_owner() != Some(InputOwner::Entry(entry)) || !app.route().is_library_family() {
+    if !holds_input(app.pages, entry) || !app.route().is_library_family() {
         return AppCommandOutcome::Refused;
     }
     if let Some(ret) = library_navigation(app.pages, app.bridge, &request, ret) {
