@@ -37,7 +37,7 @@ impl ServerSecurityNotice {
         let notice = self.poll_with(now, playing, snapshot);
         if let Some(message) = notice {
             plx_base::task::spawn_small("server security notice", move || {
-                let outcome = plx_platform::tv::toast::toast(&message);
+                let outcome = plx_os::tv::toast::toast(&message);
                 plx_base::eventlog::log(&format!("server security notice: toast {outcome:?}"));
             });
         }
@@ -71,7 +71,7 @@ fn snapshot() -> Vec<(u16, String, String)> {
 fn message(name: &str) -> String {
     let name: String = name.chars().filter(|c| !c.is_control()).take(24).collect();
     let name = if name.trim().is_empty() { "Plex" } else { name.trim() };
-    plx_platform::i18n::msg::browse_server_security_notice(name)
+    plx_os::i18n::msg::browse_server_security_notice(name)
 }
 
 #[cfg(test)]
@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn only_owned_described_servers_are_warned() {
         let _serial = plx_base::testlock::serial();
-        let _en = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+        let _en = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::En);
         plex::reset_servers_for_test();
         let unknown = plex::register_for_test("unknown", "127.0.0.1", 32400, "tok", "fixture");
         let shared = plex::register_for_test("shared", "127.0.0.1", 32401, "tok", "fixture");
@@ -113,7 +113,7 @@ mod tests {
     }
     #[test]
     fn warnings_wait_for_known_versions_and_playback_then_space_each_server_once() {
-        let _en = plx_platform::i18n::language_on_this_thread_for_test(plx_platform::i18n::Preference::En);
+        let _en = plx_os::i18n::language_on_this_thread_for_test(plx_os::i18n::Preference::En);
         let servers = |a: &str| vec![(1, "Living room".into(), a.into()),
             (2, "Family".into(), "1.43.2.9000-hash".into())];
         let mut notice = ServerSecurityNotice::default();
@@ -134,8 +134,8 @@ mod tests {
     }
     #[test]
     fn notices_fit_the_television_toast_and_sanitize_server_names() {
-        for language in plx_platform::i18n::SHIPPED {
-            let _guard = plx_platform::i18n::language_on_this_thread_for_test(language);
+        for language in plx_os::i18n::SHIPPED {
+            let _guard = plx_os::i18n::language_on_this_thread_for_test(language);
             let text = message("ABCDEFGHIJKLMNOPQRSTUVWX\nignored");
             assert!(text.chars().count() <= 120, "{}: {text}", language.tag());
             assert!(!text.contains('\n'));
